@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "versioneer[toml]"]
+build-backend = "setuptools.build_meta"
+
+[tool.versioneer]
+VCS = "git"
+versionfile_source = "jet_torch/jet_torch/_version.py"
+versionfile_build = "jet_torch/_version.py"
+parentdir_prefix = ""
+tag_prefix = "v"
+style = "pep440"
+
+[tool.isort]
+profile = "black"
+known_first_party=["pyrphoros"]
+known_first_party = ["pyrphoros"]
