@@ -1,19 +1,19 @@
 import torch
-from pyrphoros.graph import ComputeGraph
+from pyrphoros.graph import NNModuleGraph
 from torch import nn
 from torch.testing import assert_close
 
 
 def test_ComputeGraph_empty_forward():
-    g = ComputeGraph()
+    g = NNModuleGraph()
     m = g.build_module()
     m.forward({})
 
 
 def test_ComputeGraph_forward():
-    g = ComputeGraph()
+    g = NNModuleGraph()
     inp = g.add_input("inp")
-    outp = g.add_node(nn.Linear(10, 10))(inp)
+    outp = g.add_node("linear", nn.Linear(10, 10))(inp)
     g.add_output(outp=outp)
 
     m = g.build_module()
@@ -25,46 +25,73 @@ def test_ComputeGraph_forward():
     assert result["outp"].size() == (4, 10)
 
 
-def test_ComputeGraph_parameter_groups():
-    g = ComputeGraph()
-    x = g.add_input("inp")
+def test_ComputeGraph_components():
+    batch_size = 4
 
-    g._add_node
-    x = g.add_node(nn.Linear(10, 10))(x)
+    graph = NNModuleGraph()
+    x = graph.add_input("inp")
 
-    with g.parameter_group("a"):
-        outp_a = g.add_node(nn.Linear(10, 1))(x)
-        g.add_output(outp_a=outp_a)
+    x = graph.add_node("linear", nn.Linear(10, 10))(x)
 
-    with g.parameter_group("b"):
-        outp_b = g.add_node(nn.Linear(10, 1))(x)
-        g.add_output(outp_b=outp_b)
+    with graph.create_component("a") as component_a:
+        dx = component_a.add_node("detach_x", lambda x: x.detach())(x)
+        outp_a = component_a.add_node("linear", nn.Linear(10, 1))(dx)
+        component_a.add_output(outp_a=outp_a)
+        loss = component_a.add_node("loss", nn.BCEWithLogitsLoss())(
+            outp_a, torch.ones(batch_size, 1)
+        )
+        component_a.add_loss(loss)
 
-    m = g.build_module()
+    assert graph.root_component in component_a.ancestors
 
-    m.parameter_groups["root"]
-    m.parameter_groups["a"]
-    m.parameter_groups["b"]
+    with graph.create_component("b") as component_b:
+        dx = component_b.add_node("detach_x", lambda x: x.detach())(x)
+        outp_b = component_b.add_node("linear", nn.Linear(10, 1))(dx)
+        component_b.add_output(outp_b=outp_b)
+        loss = component_b.add_node("loss", nn.BCEWithLogitsLoss())(
+            outp_b, torch.ones(batch_size, 1)
+        )
+        component_b.add_loss(loss)
+
+    assert graph.root_component in component_b.ancestors
+
+    nn_module = graph.build_module()
+
+    nn_module.linear
+    nn_module.a.linear
+    nn_module.b.linear
 
     # Train
-    batch = {"inp": torch.zeros((4, 10))}
-    raw_batch = m._read_inputs(batch)
+    batch = {"inp": torch.zeros((batch_size, 10))}
+    raw_batch = nn_module._read_inputs(batch)
 
-    for name, pg in m.parameter_groups.items():
-        # Zero all model gradients
-        # (Normally, only the respective group should be zeroed: pg.parameters().zero_grad())
-        m.zero_grad()
+    for current_name, current_component_module in nn_module.component_modules.items():
+        # Zero all model gradients to be able to detect gradients "leaking" into other components.
+        # (Normally, only the respective component should be zeroed: cm.parameters().zero_grad())
+        nn_module.zero_grad()
 
-        for loss_handle in pg.backward_passes:
-            loss = m._forward_incremental(raw_batch, loss_handle)
+        for loss_ref in current_component_module.component.losses:
+            loss = nn_module._forward_incremental(raw_batch, loss_ref)
             loss.backward()
 
-        # Ensure that only gradients in the respective parameter group were updated
-        for name2, pg2 in m.parameter_groups.items():
-            if name2 == name:
-                grad = torch.mean(
-                    torch.concat([torch.linalg.norm(p.grad) if p.grad else 0 for p in pg2.parameters()])  # type: ignore
-                )
-                assert grad >= 0
+        # Ensure that only gradients in the respective component were updated
+        for other_name, other_component_module in nn_module.component_modules.items():
+            if (
+                other_component_module.component
+                in current_component_module.component.ancestors
+            ):
+                continue
+
+            gradients = [
+                torch.linalg.norm(p.grad)
+                for p in other_component_module.parameters()
+                if p.grad is not None
+            ]
+            mean_gradient = torch.mean(torch.stack(gradients)) if gradients else 0
+
+            if other_component_module is current_component_module:
+                assert mean_gradient >= 0
             else:
-                assert grad == 0
+                assert (
+                    mean_gradient == 0
+                ), f"Component {other_name!r} has a non-zero gradient when processing component {current_name!r} "

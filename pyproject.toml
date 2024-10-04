@@ -12,5 +12,4 @@ style = "pep440"
 
 [tool.isort]
 profile = "black"
-known_first_party=["pyrphoros"]
 known_first_party = ["pyrphoros"]
