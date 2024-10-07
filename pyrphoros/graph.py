@@ -15,7 +15,6 @@ from typing import (
     List,
     Literal,
     Mapping,
-    MutableMapping,
     Optional,
     Self,
     Set,
@@ -133,7 +132,7 @@ class Node:
         self, results: Container[Reference]
     ) -> Iterable[Reference]:
         """Return arguments required to compute the given results."""
-        return self.args
+        return (a for a in self.args if isinstance(a, Reference))
 
     def bound_args(self) -> Iterator[Tuple[str, Reference]]:
         """Return iterator of (argname, handle) tuples."""
@@ -350,18 +349,48 @@ class Graph(_GraphInterface, Generic[TComponent, TNode]):
             self, self.root_component, name, operation, type, shape, like
         )
 
-    @abc.abstractmethod
-    @overload
-    def slice(self, __stop): ...
+    def _slice_nodes(
+        self, given_refs: Set[Reference], required_refs: Set[Reference]
+    ) -> Tuple[List[TNode], Set[Reference]]:
+        if given_refs.issuperset(required_refs):
+            return [], set()
 
-    @abc.abstractmethod
-    @overload
-    def slice(self, __start, __stop): ...
+        nodes: List[TNode] = []
 
-    @abc.abstractmethod
-    def slice(self, *args) -> "_GraphInterface":
-        """Return a subgraph that contains the specified inputs and outputs."""
-        ...
+        for node in self.nodes[::-1]:
+            node_provided_refs = set(node.results)
+
+            # Check if node produces a required result
+            if not node_provided_refs.intersection(required_refs):
+                continue
+
+            # Prepend node to the list of nodes
+            nodes.insert(0, node)
+
+            given_refs = given_refs.union(node_provided_refs)
+
+            # Update required references: remove provided, add required minus given
+            required_refs = required_refs.union(
+                set(node._get_required_args_for(required_refs))
+            ).difference(given_refs)
+
+        return nodes, required_refs
+
+    def slice(self, output_names: str | Tuple[str, ...]) -> Self:
+        """Return a subgraph that produces the specified outputs."""
+
+        if isinstance(output_names, str):
+            output_names = (output_names,)
+
+        graph = type(self)()
+        graph.outputs = {k: self.outputs[k] for k in output_names}
+        graph.nodes, required_refs = self._slice_nodes(
+            set(), set(graph.outputs.values())
+        )
+        graph.inputs = {k: v for k, v in self.inputs.items() if v in required_refs}
+        graph.root_component = self.root_component
+
+        return graph
 
 
 class DataGraph(Graph):
@@ -493,8 +522,19 @@ class NNModuleGraphModule(NNModuleComponentModule):
 
         return raw_batch
 
-    def forward(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+    def forward(self, *batch_or_args) -> Dict[str, Any]:
         """Compute one complete forward pass."""
+
+        if len(batch_or_args) == 1 and isinstance(batch_or_args[0], Mapping):
+            batch = batch_or_args[0]
+        else:
+            batch = {k: v for k, v in zip(self.graph.inputs.keys(), batch_or_args)}
+
+        missing_arguments = set(self.graph.inputs.keys()).difference(set(batch.keys()))
+        if missing_arguments:
+            raise ValueError(
+                f"Some arguments are missing: {', '.join(sorted(missing_arguments))}"
+            )
 
         raw_batch = self._read_inputs(batch)
         raw_batch = self._forward_raw(raw_batch)
@@ -512,20 +552,11 @@ class NNModuleGraphModule(NNModuleComponentModule):
         except KeyError:
             pass
 
-        required_refs: Set[Reference] = {target}
-        available_refs: Set[Reference] = set(raw_batch.keys())
-        nodes: List[NNModuleNode] = []
+        nodes, required_refs = self.graph._slice_nodes(set(raw_batch.keys()), {target})
 
-        # Go backwards through the list of nodes
-        for node in self.graph.nodes[::-1]:
-            if not set(node.results).intersection(required_refs):
-                continue
-
-            nodes.insert(0, node)
-            required_refs.update(
-                set(node._get_required_args_for(required_refs)).difference(
-                    available_refs
-                )
+        if required_refs:
+            raise ValueError(
+                f"raw_batch does not provide all required refs: {[(r.owner.qualifiedname, r.name) for r in required_refs]}"
             )
 
         self._forward_raw(raw_batch, nodes)
@@ -567,16 +598,6 @@ class NNModuleGraph(Graph[NNModuleComponent, NNModuleNode], _NNModuleGraphInterf
 
     def add_loss(self, ref: Reference):
         self.root_component.add_loss(ref)
-
-    @overload
-    def slice(self, __stop): ...
-
-    @overload
-    def slice(self, __start, __stop): ...
-
-    def slice(self, *args) -> "_GraphInterface":
-        """Return a subgraph that contains the specified inputs and outputs."""
-        raise NotImplementedError()
 
     def build_module(self):
         return NNModuleGraphModule(self)

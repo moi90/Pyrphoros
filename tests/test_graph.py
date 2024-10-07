@@ -4,32 +4,32 @@ from torch import nn
 from torch.testing import assert_close
 
 
-def test_ComputeGraph_empty_forward():
+def test_NNModuleGraph_empty_forward():
     g = NNModuleGraph()
     m = g.build_module()
-    m.forward({})
+    m.forward()
 
 
-def test_ComputeGraph_forward():
+def test_NNModuleGraph_forward():
     g = NNModuleGraph()
-    inp = g.add_input("inp")
+    inp = g.add_input("input")
     outp = g.add_node("linear", nn.Linear(10, 10))(inp)
     g.add_output(outp=outp)
 
     m = g.build_module()
 
-    result = m.forward({"inp": torch.zeros((4, 10))})
+    result = m.forward(torch.zeros((4, 10)))
 
     assert "outp" in result
 
     assert result["outp"].size() == (4, 10)
 
 
-def test_ComputeGraph_components():
+def test_NNModuleGraph_components():
     batch_size = 4
 
     graph = NNModuleGraph()
-    x = graph.add_input("inp")
+    x = graph.add_input("input")
 
     x = graph.add_node("linear", nn.Linear(10, 10))(x)
 
@@ -62,7 +62,7 @@ def test_ComputeGraph_components():
     nn_module.b.linear
 
     # Train
-    batch = {"inp": torch.zeros((batch_size, 10))}
+    batch = {"input": torch.zeros((batch_size, 10))}
     raw_batch = nn_module._read_inputs(batch)
 
     for current_name, current_component_module in nn_module.component_modules.items():
@@ -95,3 +95,36 @@ def test_ComputeGraph_components():
                 assert (
                     mean_gradient == 0
                 ), f"Component {other_name!r} has a non-zero gradient when processing component {current_name!r} "
+
+
+def test_NNModuleGraph_slice():
+    batch_size = 4
+
+    graph = NNModuleGraph()
+    x = graph.add_input("input")
+
+    x = graph.add_node("linear", nn.Linear(10, 10))(x)
+
+    with graph.create_component("a") as component_a:
+        dx = component_a.add_node("detach_x", lambda x: x.detach())(x)
+        outp_a = component_a.add_node("linear", nn.Linear(10, 1))(dx)
+        loss = component_a.add_node("loss", nn.BCEWithLogitsLoss())(
+            outp_a, torch.ones(batch_size, 1)
+        )
+        component_a.add_output(output=outp_a, loss=loss)
+        component_a.add_loss(loss)
+
+    with graph.create_component("b") as component_b:
+        dx = component_b.add_node("detach_x", lambda x: x.detach())(x)
+        outp_b = component_b.add_node("linear", nn.Linear(10, 1))(dx)
+        loss = component_b.add_node("loss", nn.BCEWithLogitsLoss())(
+            outp_b, torch.ones(batch_size, 1)
+        )
+        component_b.add_output(output=outp_b, loss=loss)
+        component_b.add_loss(loss)
+
+    subgraph = graph.slice("b.loss")
+
+    nn_module = subgraph.build_module()
+
+    nn_module.forward(torch.zeros((batch_size, 10)))
